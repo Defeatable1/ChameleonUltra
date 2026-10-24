@@ -11,7 +11,6 @@
 #include "nrf_sdh_ble.h"
 #include "nrf_ble_gatt.h"
 #include "nrf_ble_lesc.h"
-#include "nrf_drv_saadc.h"
 
 #include "peer_manager.h"
 #include "peer_manager_handler.h"
@@ -63,12 +62,15 @@ NRF_LOG_MODULE_REGISTER();
 #define NEXT_CONN_PARAMS_UPDATE_DELAY   APP_TIMER_TICKS(30000)                      /**< Time between each call to sd_ble_gap_conn_param_update after the first call (30 seconds). */
 #define MAX_CONN_PARAMS_UPDATE_COUNT    3                                           /**< Number of attempts before giving up the connection parameter negotiation. */
 
-// #define BATTERY_LEVEL_MEAS_INTERVAL     APP_TIMER_TICKS(1000)                       /**< Battery level measurement interval (ticks). This value corresponds to 1 seconds. */
-#define BATTERY_LEVEL_MEAS_INTERVAL     APP_TIMER_TICKS(5000)                     /**< Battery level measurement interval (ticks). This value corresponds to N seconds. */
+#define BATTERY_LEVEL_MEAS_INTERVAL     APP_TIMER_TICKS(5000)                       /**< Battery level measurement interval (ticks). This value corresponds to N seconds. */
 
 #define ADC_REF_VOLTAGE_IN_MILLIVOLTS  600  //!< Reference voltage (in milli volts) used by ADC while doing conversion.
 #define ADC_RES_12BIT                  16383 //!< Maximum digital value for 14-bit ADC conversion.
 #define ADC_PRE_SCALING_COMPENSATION   12    //!< The ADC is configured to use VDD with 1/3 prescaling as input. And hence the result of conversion is to be multiplied by 3 to get the actual value of the battery voltage.
+#define ADC_CHANNEL                    0
+#define ADC_BUF_SIZE                   2048
+#define ADC_BUF_COUNT                  2
+
 
 /**@brief Macro to convert the result of ADC conversion in millivolts.
  *
@@ -88,9 +90,11 @@ BLE_ADVERTISING_DEF(m_advertising);                                             
 
 uint16_t          batt_lvl_in_milli_volts = 0;
 uint8_t           percentage_batt_lvl = 0;
-static nrf_saadc_value_t adc_buf[2];
+static nrf_saadc_value_t adc_buf[ADC_BUF_COUNT][ADC_BUF_SIZE];
 static uint16_t   m_conn_handle          = BLE_CONN_HANDLE_INVALID;                 /**< Handle of the current connection. */
 static uint16_t   m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;            /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
+lf_adc_callback_t m_lf_adc_callback      = NULL;
+
 static ble_uuid_t m_adv_uuids[]          =                                          /**< Universally unique service identifier. */
 {
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE},
@@ -99,6 +103,14 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 volatile bool g_is_ble_connected = false;
 volatile bool g_is_low_battery_shutdown = false;
 static ble_opt_t m_static_pin_option;
+
+// Simple function to provide an index to the next input buffer
+// Will simply alernate between 0 and 1 when SAADC_BUF_COUNT is 2
+static uint32_t next_free_buf_index(void) {
+    static uint32_t buffer_index = -1;
+    buffer_index = (buffer_index + 1) % ADC_BUF_COUNT;
+    return buffer_index;
+}
 
 
 /**@brief Function for the ble connect key setup.
@@ -220,51 +232,71 @@ static void nrf_qwr_error_handler(uint32_t nrf_error) {
     APP_ERROR_HANDLER(nrf_error);
 }
 
-__INLINE uint32_t map(uint32_t x, uint32_t in_min, uint32_t in_max, uint32_t out_min, uint32_t out_max) {
-    return (uint32_t)(MIN((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min, out_max));
+// The battery curve is calibrated against the lowest stable full-charge voltage
+// we have observed after unplugging USB and letting the cell settle. In issue
+// #334 the reported range looks like a typo and the plausible value is
+// 4160-4190 mV, so we use the conservative lower bound to keep 100% reachable.
+#define BATTERY_FULL_CHARGE_REFERENCE_MV  4160U
+#define BATTERY_CURVE_BASE_FULL_MV        4200U
+#define BATTERY_CURVE_SCALE(mv) \
+    ((uint32_t)(((uint32_t)(mv) * BATTERY_FULL_CHARGE_REFERENCE_MV + (BATTERY_CURVE_BASE_FULL_MV / 2U)) / BATTERY_CURVE_BASE_FULL_MV))
+
+static uint32_t map_clamped(uint32_t x, uint32_t in_min, uint32_t in_max, uint32_t out_min, uint32_t out_max) {
+    if (in_max <= in_min) {
+        return out_min;
+    }
+    if (x <= in_min) {
+        return out_min;
+    }
+    if (x >= in_max) {
+        return out_max;
+    }
+
+    return out_min + ((x - in_min) * (out_max - out_min)) / (in_max - in_min);
 }
 
-//Battery voltage to percentage calculation
+// Battery voltage to percentage calculation
 uint32_t BATVOL2PERCENT(uint16_t VOL) {
     // Based on https://github.com/RfidResearchGroup/ChameleonUltra/issues/167#issuecomment-1766908799
+    // and recalibrated from the issue #334 full-charge measurements.
+    const uint32_t p100vol = BATTERY_CURVE_SCALE(4200U);
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
-// Ultra
-#define P100VOL 4200
-#define P80VOL  4034
-#define P60VOL  3904
-#define P40VOL  3824
-#define P20VOL  3754
-#define P5VOL   3644
+    // Ultra
+    const uint32_t p80vol = BATTERY_CURVE_SCALE(4034U);
+    const uint32_t p60vol = BATTERY_CURVE_SCALE(3904U);
+    const uint32_t p40vol = BATTERY_CURVE_SCALE(3824U);
+    const uint32_t p20vol = BATTERY_CURVE_SCALE(3754U);
+    const uint32_t p5vol = BATTERY_CURVE_SCALE(3644U);
 #else
-// Lite
-#define P100VOL 4200
-#define P80VOL  3934
-#define P60VOL  3844
-#define P40VOL  3784
-#define P20VOL  3744
-#define P5VOL   3644
+    // Lite
+    const uint32_t p80vol = BATTERY_CURVE_SCALE(3934U);
+    const uint32_t p60vol = BATTERY_CURVE_SCALE(3844U);
+    const uint32_t p40vol = BATTERY_CURVE_SCALE(3784U);
+    const uint32_t p20vol = BATTERY_CURVE_SCALE(3744U);
+    const uint32_t p5vol = BATTERY_CURVE_SCALE(3644U);
 #endif
 
-    if (VOL > P80VOL) {
-        //80-100
-        return map(VOL, P80VOL, P100VOL, 80, 100);
-    } else if (VOL > P60VOL) {
-        //60-80
-        return map(VOL, P60VOL, P80VOL, 60, 80);
-    } else if (VOL > P40VOL) {
-        //40-60
-        return map(VOL, P40VOL, P60VOL, 40, 60);
-    } else if (VOL > P20VOL) {
-        //20-60
-        return map(VOL, P20VOL, P40VOL, 20, 40);
-    } else if (VOL > P5VOL) {
-        //5-20
-        return map(VOL, P5VOL, P20VOL, 5, 20);
-    } else {
-        //<5
-        return 0;
+    if (VOL >= p100vol) {
+        return 100;
+    } else if (VOL > p80vol) {
+        // 80-100
+        return map_clamped(VOL, p80vol, p100vol, 80, 100);
+    } else if (VOL > p60vol) {
+        // 60-80
+        return map_clamped(VOL, p60vol, p80vol, 60, 80);
+    } else if (VOL > p40vol) {
+        // 40-60
+        return map_clamped(VOL, p40vol, p60vol, 40, 60);
+    } else if (VOL > p20vol) {
+        // 20-40
+        return map_clamped(VOL, p20vol, p40vol, 20, 40);
+    } else if (VOL > p5vol) {
+        // 5-20
+        return map_clamped(VOL, p5vol, p20vol, 5, 20);
     }
+
+    return 0;
 }
 
 /**@brief Function for initializing services that will be used by the application.
@@ -495,7 +527,6 @@ static void ble_stack_init(void) {
     NRF_SDH_BLE_OBSERVER(m_ble_observer, APP_BLE_OBSERVER_PRIO, ble_evt_handler, NULL);
 }
 
-
 /**@brief Function for handling events from the GATT library. */
 void gatt_evt_handler(nrf_ble_gatt_t *p_gatt, nrf_ble_gatt_evt_t const *p_evt) {
     if ((m_conn_handle == p_evt->conn_handle) && (p_evt->evt_id == NRF_BLE_GATT_EVT_ATT_MTU_UPDATED)) {
@@ -669,60 +700,29 @@ static void peer_manager_init(void) {
 
 /**@brief Function for handling the ADC interrupt.
  *
- * @details  This function will fetch the conversion result from the ADC, convert the value into
- *           percentage and send it to peer.
+ * @details  This function fetchs conversion result from the ADC, then callback lf with samples.
  */
-void saadc_event_handler(nrf_drv_saadc_evt_t const *p_event) {
-    if (p_event->type == NRF_DRV_SAADC_EVT_DONE) {
-        nrf_saadc_value_t adc_result;
-        uint32_t          err_code;
-
-        adc_result = p_event->data.done.p_buffer[0];
-        // NRF_LOG_INFO("ADC sample value = %d", adc_result);
-
-        err_code = nrf_drv_saadc_buffer_convert(p_event->data.done.p_buffer, 1);
+void saadc_event_handler(nrfx_saadc_evt_t const *p_event) {
+    if (p_event->type == NRFX_SAADC_EVT_DONE && m_lf_adc_callback != NULL) {
+        ret_code_t err_code;
+        err_code = nrfx_saadc_buffer_convert(&adc_buf[next_free_buf_index()][0], ADC_BUF_SIZE);
         APP_ERROR_CHECK(err_code);
 
-        batt_lvl_in_milli_volts = ADC_RESULT_IN_MILLI_VOLTS(adc_result) + 100;
-        // NRF_LOG_INFO("batt_lvl_in_milli_volts: %d", batt_lvl_in_milli_volts);
-        percentage_batt_lvl = BATVOL2PERCENT(batt_lvl_in_milli_volts);
-
-        // if battery service is notification enable, we can send msg to device.
-        err_code = ble_bas_battery_level_update(&m_bas, percentage_batt_lvl, BLE_CONN_HANDLE_ALL);
-        if ((err_code != NRF_SUCCESS) &&
-                (err_code != NRF_ERROR_INVALID_STATE) &&
-                (err_code != NRF_ERROR_RESOURCES) &&
-                (err_code != NRF_ERROR_BUSY) &&
-                (err_code != NRF_ERROR_FORBIDDEN) &&
-                (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)) {
-            APP_ERROR_HANDLER(err_code);
-        }
-
-        // check low battery level, if level == 0, we can try to shutdown.
-        if (percentage_batt_lvl == 0) {
-            NRF_LOG_INFO("battery too low, try to shutdown...");
-            g_is_low_battery_shutdown = true;
-            sleep_timer_start(SLEEP_NO_BATTERY_SHUTDOWN);
-        } else {
-            g_is_low_battery_shutdown = false;
-        }
+        m_lf_adc_callback(p_event->data.done.p_buffer, p_event->data.done.size);
     }
 }
 
 /**@brief Function for configuring ADC to do battery level conversion.
  */
 static void adc_configure(void) {
-    ret_code_t err_code = nrf_drv_saadc_init(NULL, saadc_event_handler);
+    ret_code_t err_code;
+
+    nrfx_saadc_config_t cfg = NRFX_SAADC_DEFAULT_CONFIG;
+    err_code = nrfx_saadc_init(&cfg, saadc_event_handler);
     APP_ERROR_CHECK(err_code);
 
-    nrf_saadc_channel_config_t config = NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(BAT_SENSE);
-    err_code = nrf_drv_saadc_channel_init(0, &config);
-    APP_ERROR_CHECK(err_code);
-
-    err_code = nrf_drv_saadc_buffer_convert(&adc_buf[0], 1);
-    APP_ERROR_CHECK(err_code);
-
-    err_code = nrf_drv_saadc_buffer_convert(&adc_buf[1], 1);
+    nrf_saadc_channel_config_t ch = NRFX_SAADC_DEFAULT_CHANNEL_CONFIG_SE(BAT_SENSE);
+    err_code = nrfx_saadc_channel_init(ADC_CHANNEL, &ch);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -737,9 +737,41 @@ static void adc_configure(void) {
 static void battery_level_meas_timeout_handler(void *p_context) {
     UNUSED_PARAMETER(p_context);
 
+    // When LF sample is enabled, PWM triggers ADC samples through PPI, at 125khz sample rate.
+    // To avoid corrupt LF samples, here we ignore battery level measure timer for a while.
+    if (m_lf_adc_callback != NULL) {
+        return;
+    }
+
+    // Here we fetch the conversion result from the ADC, convert the value into
+    // percentage and send it to peer.
     ret_code_t err_code;
-    err_code = nrf_drv_saadc_sample();
+    nrf_saadc_value_t adc_result;
+    err_code = nrfx_saadc_sample_convert(ADC_CHANNEL, &adc_result);
     APP_ERROR_CHECK(err_code);
+
+    batt_lvl_in_milli_volts = ADC_RESULT_IN_MILLI_VOLTS(adc_result) + 100;
+    percentage_batt_lvl = BATVOL2PERCENT(batt_lvl_in_milli_volts);
+
+    // if battery service is notification enable, we can send msg to device.
+    err_code = ble_bas_battery_level_update(&m_bas, percentage_batt_lvl, BLE_CONN_HANDLE_ALL);
+    if ((err_code != NRF_SUCCESS) &&
+            (err_code != NRF_ERROR_INVALID_STATE) &&
+            (err_code != NRF_ERROR_RESOURCES) &&
+            (err_code != NRF_ERROR_BUSY) &&
+            (err_code != NRF_ERROR_FORBIDDEN) &&
+            (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)) {
+        APP_ERROR_HANDLER(err_code);
+    }
+
+    // check low battery level, if level == 0, we can try to shutdown.
+    if (percentage_batt_lvl == 0) {
+        NRF_LOG_INFO("battery too low, try to shutdown...");
+        g_is_low_battery_shutdown = true;
+        sleep_timer_start(SLEEP_NO_BATTERY_SHUTDOWN);
+    } else {
+        g_is_low_battery_shutdown = false;
+    }
 }
 
 void create_battery_timer(void) {
@@ -765,4 +797,33 @@ void ble_slave_init(void) {
     advertising_init();                 // Broadcast parameter initialization
     conn_params_init();                 // Connection parameter initialization
     peer_manager_init();                // Peer manager Initialization
+}
+
+void register_lf_adc_callback(lf_adc_callback_t cb) {
+    m_lf_adc_callback = cb;
+
+    nrfx_saadc_uninit();
+
+    ret_code_t err_code;
+
+    nrfx_saadc_config_t cfg = NRFX_SAADC_DEFAULT_CONFIG;
+    err_code = nrfx_saadc_init(&cfg, saadc_event_handler);
+    APP_ERROR_CHECK(err_code);
+
+    nrf_saadc_channel_config_t ch = NRFX_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_AIN5);
+    ch.acq_time = NRF_SAADC_ACQTIME_5US;
+    err_code = nrfx_saadc_channel_init(ADC_CHANNEL, &ch);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrfx_saadc_buffer_convert(&adc_buf[next_free_buf_index()][0], ADC_BUF_SIZE);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrfx_saadc_buffer_convert(&adc_buf[next_free_buf_index()][0], ADC_BUF_SIZE);
+    APP_ERROR_CHECK(err_code);
+}
+
+void unregister_lf_adc_callback(void) {
+    nrfx_saadc_uninit();
+    adc_configure();
+    m_lf_adc_callback = NULL;
 }

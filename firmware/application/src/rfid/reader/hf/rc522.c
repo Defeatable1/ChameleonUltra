@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <nrf_gpio.h>
 
 #include "nrf_drv_spi.h"
@@ -13,6 +14,8 @@
 #include "app_status.h"
 #include "hex_utils.h"
 #include "crc_utils.h"
+#include "ulc_3des.h"
+#include "nrf_drv_rng.h"
 
 #define NRF_LOG_MODULE_NAME rc522
 #include "nrf_log.h"
@@ -38,6 +41,15 @@ static autotimer *g_timeout_auto_timer;
 // RC522 SPI
 #define SPI_INSTANCE  0 /**< SPI instance index. */
 static const nrf_drv_spi_t s_spiHandle = NRF_DRV_SPI_INSTANCE(SPI_INSTANCE);    // SPI instance
+
+/*
+Default HF 14a config is set to:
+    forcebcc = 0 (expect valid BCC)
+    forcecl2 = 0 (auto)
+    forcecl3 = 0 (auto)
+    forcerats = 0 (auto)
+*/
+static hf14a_config_t hf14aconfig = { 0, 0, 0, 0 };
 
 #define ONCE_OPT __attribute__((optimize("O3")))
 
@@ -622,7 +634,7 @@ uint8_t pcd_14a_reader_bytes_transfer_flags(uint8_t Command, uint8_t *pIn, uint8
 * @param  :tag: tag info buffer
 * @retval : if return STATUS_HF_TAG_OK, the tag is selected.
 */
-uint8_t pcd_14a_reader_fast_select(picc_14a_tag_t *tag) { 
+uint8_t pcd_14a_reader_fast_select(picc_14a_tag_t *tag) {
     uint8_t dat_buff[9] = { 0x00 };
     uint8_t status = STATUS_HF_TAG_OK;
     uint8_t cascade_level = 0;
@@ -690,6 +702,7 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
     uint8_t status;
     uint8_t do_cascade = 1;
     uint8_t cascade_level = 0;
+    bool do_rats = false;
 
     // OK we will select at least at cascade 1, lets see if first byte of UID was 0x88 in
     // which case we need to make a cascade 2 request and select - this is a long UID
@@ -727,7 +740,12 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
         uint8_t bcc = sel_uid[2] ^ sel_uid[3] ^ sel_uid[4] ^ sel_uid[5]; // calculate BCC
         if (sel_uid[6] != bcc) {
             NRF_LOG_INFO("BCC%d incorrect, got 0x%02x, expected 0x%02x\n", cascade_level, sel_uid[6], bcc);
-            return STATUS_HF_ERR_BCC;
+
+            if (hf14aconfig.forcebcc == 0) {
+                return STATUS_HF_ERR_BCC;
+            } else if (hf14aconfig.forcebcc == 1) {
+                sel_uid[6] = bcc;
+            } // else use card BCC
         }
 
         crc_14a_append(sel_uid, 7); // calculate and add CRC
@@ -745,6 +763,20 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
         // If UID is 0X88 The beginning of the form shows that the UID is not complete
         // In the next cycle, we need to make an increased level, return to the end of the anti -rushing collision, and complete the level
         do_cascade = (((tag->sak & 0x04) /* && uid_resp[0] == 0x88 */) > 0);
+
+        if (cascade_level == 0) {
+            if (hf14aconfig.forcecl2 == 2) {
+                do_cascade = false;
+            } else if (hf14aconfig.forcecl2 == 1) {
+                do_cascade = true;
+            } // else 0==auto
+        } else if (cascade_level == 1) {
+            if (hf14aconfig.forcecl3 == 2) {
+                do_cascade = false;
+            } else if (hf14aconfig.forcecl3 == 1) {
+                do_cascade = true;
+            } // else 0==auto
+        }
         if (do_cascade) {
             // Remove first byte, 0x88 is not an UID byte, it CT, see page 3 of:
             // http://www.nxp.com/documents/application_note/AN10927.pdf
@@ -761,7 +793,17 @@ uint8_t pcd_14a_reader_scan_once(picc_14a_tag_t *tag) {
         // Therefore + 1
         tag->cascade = cascade_level + 1;
     }
-    if (tag->sak & 0x20) {
+
+    if (hf14aconfig.forcerats == 2) {
+        do_rats = false;
+        NRF_LOG_INFO("Skipping RATS according to hf 14a config");
+    } else if (hf14aconfig.forcerats == 1) {
+        do_rats = true;
+        NRF_LOG_INFO("Forcing RATS according to hf 14a config");
+    } else {
+        do_rats = tag->sak & 0x20;
+    }
+    if (do_rats) {
         // Tag supports 14443-4, sending RATS
         uint16_t ats_size;
         status = pcd_14a_reader_ats_request(tag->ats, &ats_size, 0xFF * 8);
@@ -822,7 +864,7 @@ uint8_t pcd_14a_reader_scan_auto(picc_14a_tag_t *tag) {
 * @retval : Status value hf_tag_ok, success
 */
 uint8_t pcd_14a_reader_ats_request(uint8_t *pAts, uint16_t *szAts, uint16_t szAtsBitMax) {
-    uint8_t rats[] = { PICC_RATS, 0x80, 0x31, 0x73 }; // FSD=256, FSDI=8, CID=0
+    uint8_t rats[] = { PICC_RATS, 0x40, 0x3D, 0xB5 }; // FSD=48, FSDI=4, CID=0 (fits RC522 64-byte FIFO)
     uint8_t status;
 
     status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, rats, sizeof(rats), pAts, szAts, szAtsBitMax);
@@ -1098,6 +1140,98 @@ uint8_t pcd_14a_reader_mf1_write(uint8_t addr, uint8_t *p) {
     return pcd_14a_reader_mf1_write_by_cmd(PICC_WRITE, addr, p);
 }
 
+#define MIFARE_ULC_AUTH_1        0x1A
+#define MIFARE_ULC_AUTH_2        0xAF
+#define MIFARE_ULTRALIGHT_WRITE  0xA2
+
+static void ulc_reader_rng(uint8_t *buf, uint8_t len) {
+    uint8_t got = 0;
+    uint32_t guard = 0;
+    while (got < len) {
+        uint8_t avail = 0;
+        nrf_drv_rng_bytes_available(&avail);
+        if (avail > 0) {
+            uint8_t want = (uint8_t)(len - got);
+            uint8_t chunk = (avail < want) ? avail : want;
+            if (nrf_drv_rng_rand(buf + got, chunk) == NRF_SUCCESS) {
+                got += chunk;
+                continue;
+            }
+        }
+        if (++guard > 200000) {
+            while (got < len) buf[got++] = (uint8_t)rand();
+            break;
+        }
+    }
+}
+
+uint8_t pcd_14a_reader_mf0_ulc_auth(uint8_t *key) {
+    uint8_t status;
+    uint16_t rx_bits = 0;
+    uint8_t buf[24];
+    uint8_t iv[8] = { 0 };
+    uint8_t ek_rndb[8], rndb[8], rnda[8], token_plain[16], token[16], resp_enc[8], rnda_back[8];
+
+    buf[0] = MIFARE_ULC_AUTH_1;
+    buf[1] = 0x00;
+    crc_14a_append(buf, 2);
+    status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, buf, 4, buf, &rx_bits, U8ARR_BIT_LEN(buf));
+    if (status != STATUS_HF_TAG_OK) {
+        return status;
+    }
+    if (rx_bits != (11 * 8) || buf[0] != MIFARE_ULC_AUTH_2) {
+        return STATUS_HF_ERR_STAT;
+    }
+    memcpy(ek_rndb, &buf[1], 8);
+
+    ulc_tdes_dec_cbc(rndb, ek_rndb, 8, key, iv);
+    ulc_rol8(rndb);
+
+    ulc_reader_rng(rnda, 8);
+
+    memcpy(&token_plain[0], rnda, 8);
+    memcpy(&token_plain[8], rndb, 8);
+    ulc_tdes_enc_cbc(token, token_plain, 16, key, iv);
+
+    buf[0] = MIFARE_ULC_AUTH_2;
+    memcpy(&buf[1], token, 16);
+    crc_14a_append(buf, 17);
+    status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, buf, 19, buf, &rx_bits, U8ARR_BIT_LEN(buf));
+    if (status != STATUS_HF_TAG_OK) {
+        return status;
+    }
+    if (rx_bits != (11 * 8)) {
+        return STATUS_MF_ERR_AUTH;
+    }
+    memcpy(resp_enc, &buf[1], 8);
+
+    ulc_tdes_dec_cbc(rnda_back, resp_enc, 8, key, iv);
+    ulc_rol8(rnda);
+    if (memcmp(rnda_back, rnda, 8) != 0) {
+        return STATUS_MF_ERR_AUTH;
+    }
+    return STATUS_HF_TAG_OK;
+}
+
+uint8_t pcd_14a_reader_mf0_ult_write_page(uint8_t page, uint8_t *data) {
+    uint8_t status;
+    uint16_t rx_bits = 0;
+    uint8_t buf[8];
+
+    buf[0] = MIFARE_ULTRALIGHT_WRITE;
+    buf[1] = page;
+    memcpy(&buf[2], data, 4);
+    crc_14a_append(buf, 6);
+    status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, buf, 8, buf, &rx_bits, U8ARR_BIT_LEN(buf));
+    if (status != STATUS_HF_TAG_OK) {
+        return status;
+    }
+    if (rx_bits != 4 || (buf[0] & 0x0F) != 0x0A) {
+        return STATUS_HF_ERR_STAT;
+    }
+    return STATUS_HF_TAG_OK;
+}
+
 /**
  * @brief  : Increment: increments the contents of a block and stores the result in the internal Transfer Buffer
  *           Decrement: decrements the contents of a block and stores the result in the internal Transfer Buffer
@@ -1144,14 +1278,14 @@ uint8_t pcd_14a_reader_mf1_manipulate_value_block(uint8_t operator, uint8_t addr
 
     // 2. Transfer the operand to complete the value block manipulation
     status = pcd_14a_reader_bytes_transfer_flags(
-        PCD_TRANSCEIVE, 
-        dat_buff, 
-        6, 
-        dat_buff, 
-        &dat_len, 
-        U8ARR_BIT_LEN(dat_buff), 
-        PCD_TRANSMIT_FLAG_NO_RESET_MF_CRYPTO1_ON);
-    
+                 PCD_TRANSCEIVE,
+                 dat_buff,
+                 6,
+                 dat_buff,
+                 &dat_len,
+                 U8ARR_BIT_LEN(dat_buff),
+                 PCD_TRANSMIT_FLAG_NO_RESET_MF_CRYPTO1_ON);
+
     // Operand Part of Increment/Decrement/Restore does not acknowledge, so Timeout means success
     if (status != STATUS_HF_TAG_NO || dat_len != 0) {
         return status == STATUS_HF_TAG_OK ? STATUS_HF_ERR_STAT : status;
@@ -1538,4 +1672,26 @@ uint8_t pcd_14a_reader_raw_cmd(bool openRFField,  bool waitResp, bool appendCrc,
     }
 
     return status;
+}
+
+void set_hf14a_config(const hf14a_config_t *hc) {
+    if ((hc->forcebcc >= 0) && (hc->forcebcc <= 2)) {
+        hf14aconfig.forcebcc = hc->forcebcc;
+    }
+
+    if ((hc->forcecl2 >= 0) && (hc->forcecl2 <= 2)) {
+        hf14aconfig.forcecl2 = hc->forcecl2;
+    }
+
+    if ((hc->forcecl3 >= 0) && (hc->forcecl3 <= 2)) {
+        hf14aconfig.forcecl3 = hc->forcecl3;
+    }
+
+    if ((hc->forcerats >= 0) && (hc->forcerats <= 2)) {
+        hf14aconfig.forcerats = hc->forcerats;
+    }
+}
+
+hf14a_config_t *get_hf14a_config(void) {
+    return &hf14aconfig;
 }

@@ -5,14 +5,21 @@
 
 #include "utils.h"
 
-#define SETTINGS_CURRENT_VERSION 5
+#define SETTINGS_CURRENT_VERSION 7
+#define SETTINGS_SLEEP_TIMEOUT_DEFAULT_S 8   // default wake timeout in seconds (matches SLEEP_DELAY_MS_BUTTON_WAKEUP)
+#define SETTINGS_SLEEP_TIMEOUT_MIN_S      5
+#define SETTINGS_SLEEP_TIMEOUT_MAX_S      60
+#define SETTINGS_LONG_PRESS_THRESHOLD_DEFAULT_MS 1000
+#define SETTINGS_LONG_PRESS_THRESHOLD_MIN_MS     200
 #define BLE_PAIRING_KEY_LEN 6
 #define DEFAULT_BLE_PAIRING_KEY "123456"  // length must == 6
 
 typedef enum {
     SettingsAnimationModeFull = 0U,
     SettingsAnimationModeMinimal = 1U,
+    SettingsAnimationModeSymmetric = 3U,
     SettingsAnimationModeNone = 2U,
+    SettingsAnimationModeMAX = 4U,
 } settings_animation_mode_t;
 
 typedef enum {
@@ -26,6 +33,8 @@ typedef enum {
     // Read the UID card number immediately after pressing, continue searching, and simulate immediately after reading the card
     SettingsButtonCloneIcUid = 3U,
     SettingsButtonShowBattery = 4U,
+    // Toggle NFC field generator on/off (Ultra only, must be in reader mode)
+    SettingsButtonNfcFieldGenerator = 5U,
 } settings_button_function_t;
 
 typedef struct ALIGN_U32 {
@@ -47,8 +56,11 @@ typedef struct ALIGN_U32 {
     // 6 byte
     uint8_t ble_connect_key[6];
 
-    // 1 byte
-    uint8_t reserved1; // see bottom.
+    // 1 byte (add on version6)
+    uint8_t sleep_timeout; // wake timeout in seconds after button wakeup
+
+    // 2 bytes (add on version7)
+    uint16_t long_press_threshold; // long button press threshold in ms
 
     /*
      * Warning !!!!!!!!!!!!!!!!!!!!!! <-------------
@@ -74,4 +86,10 @@ void settings_set_ble_connect_key(uint8_t *key);
 void settings_set_ble_pairing_enable(bool enable);
 bool settings_get_ble_pairing_enable(void);
 bool settings_get_ble_pairing_enable_first_load(void);
+uint32_t settings_get_sleep_timeout(void);
+void settings_set_sleep_timeout(uint8_t seconds);
+void settings_init_sleep_timeout_config(void);
+uint16_t settings_get_long_press_threshold(void);
+void settings_set_long_press_threshold(uint16_t duration);
+void settings_init_long_press_threshold_config(void);
 #endif

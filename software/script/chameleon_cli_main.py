@@ -10,7 +10,11 @@ import pathlib
 import prompt_toolkit
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory
-from chameleon_utils import CR, CG, CY, C0
+from chameleon_utils import CR, CG, CY, color_string
+
+
+EXIT_SUCCESS = 0
+EXIT_NONINTERACTIVE = 2
 
 ULTRA = r"""
                                                                 ╦ ╦╦ ╔╦╗╦═╗╔═╗
@@ -68,10 +72,12 @@ class ChameleonCLI:
 
         :return: current cmd prompt
         """
-        device_string = f"{CG}USB" if self.device_com.isOpen(
-        ) else f"{CR}Offline"
-        status = f"[{device_string}{C0}] chameleon --> "
-        return status
+        if self.device_com.isOpen():
+            status = color_string((CG, 'USB'))
+        else:
+            status = color_string((CR, 'Offline'))
+
+        return ANSI(f"[{status}] chameleon --> ")
 
     @staticmethod
     def print_banner():
@@ -80,7 +86,7 @@ class ChameleonCLI:
 
         :return:
         """
-        print(f"{CY}{BANNER}{C0}")
+        print(color_string((CY, BANNER)))
 
     def exec_cmd(self, cmd_str):
         if cmd_str == '':
@@ -102,7 +108,7 @@ class ChameleonCLI:
             # Found tree node is a group without an implementation, print children
             print("".ljust(18, "-") + "".ljust(10) + "".ljust(30, "-"))
             for child in tree_node.children:
-                cmd_title = f"{CG}{child.name}{C0}"
+                cmd_title = color_string((CG, child.name))
                 if not child.cls:
                     help_line = (f" - {cmd_title}".ljust(37)) + f"{{ {child.help_text}... }}"
                 else:
@@ -123,7 +129,7 @@ class ChameleonCLI:
                 return
         except chameleon_utils.ArgsParserError as e:
             args.print_help()
-            print(f'{CY}'+str(e).strip()+f'{C0}', end="\n\n")
+            print(color_string((CY, str(e).strip())))
             return
         except chameleon_utils.ParserExitIntercept:
             # don't exit process.
@@ -144,10 +150,9 @@ class ChameleonCLI:
                 raise error
 
         except (chameleon_utils.UnexpectedResponseError, chameleon_utils.ArgsParserError) as e:
-            print(f"{CR}{str(e)}{C0}")
+            print(color_string((CR, str(e))))
         except Exception:
-            print(
-                f"CLI exception: {CR}{traceback.format_exc()}{C0}")
+            print(f"CLI exception: {color_string((CR, traceback.format_exc()))}")
 
     def startCLI(self):
         """
@@ -169,7 +174,7 @@ class ChameleonCLI:
                 # wait user input
                 try:
                     cmd_str = self.session.prompt(
-                        ANSI(self.get_prompt())).strip()
+                        self.get_prompt()).strip()
                     cmd_strs = cmd_str.replace(
                         "\r\n", "\n").replace("\r", "\n").split("\n")
                     cmd_str = cmd_strs.pop(0)
@@ -180,9 +185,47 @@ class ChameleonCLI:
             self.exec_cmd(cmd_str)
 
 
-if __name__ == '__main__':
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Chameleon Ultra CLI")
+    parser.add_argument(
+        "-c",
+        "--command",
+        action="append",
+        help="execute one CLI command and exit; may be passed more than once",
+    )
+    return parser
+
+
+def main(argv=None) -> int:
     if sys.version_info < (3, 9):
         raise Exception("This script requires at least Python 3.9")
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
     colorama.init(autoreset=True)
     chameleon_cli_unit.check_tools()
-    ChameleonCLI().startCLI()
+
+    cli = ChameleonCLI()
+    if args.command:
+        for command in args.command:
+            try:
+                cli.exec_cmd(command)
+            except SystemExit as e:
+                # The interactive "exit" command uses a non-zero sentinel to
+                # break the prompt loop. Treat it as success for one-shot use.
+                if e.code == 996:
+                    return EXIT_SUCCESS
+                raise
+        return EXIT_SUCCESS
+
+    if not sys.stdin.isatty():
+        parser.error("an interactive terminal is required unless --command is used")
+        return EXIT_NONINTERACTIVE
+
+    cli.startCLI()
+    return EXIT_SUCCESS
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

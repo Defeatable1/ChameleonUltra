@@ -12,6 +12,7 @@
 #include "nrf_delay.h"
 #include "nrf_drv_gpiote.h"
 #include "nrf_drv_rng.h"
+#include "nfc_mf1.h"         // for nfc_tag_mf1_prng_seed
 #include "nrf_power.h"
 #include "nrf_pwr_mgmt.h"
 #include "nrfx_nfct.h"
@@ -31,6 +32,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "bsp_time.h"
 #include "bsp_wdt.h"
 #include "dataframe.h"
+#include "battery_health.h"
 #include "fds_util.h"
 #include "hex_utils.h"
 #include "rfid_main.h"
@@ -41,8 +43,13 @@ NRF_LOG_MODULE_REGISTER();
 #include "tag_persistence.h"
 #include "settings.h"
 
+#if defined(PROJECT_CHAMELEON_ULTRA)
+#include "rc522.h"
+#endif
+
 // Defining soft timers
 APP_TIMER_DEF(m_button_check_timer); // Timer for button debounce
+#define BATTERY_STATUS_DISPLAY_DURATION_MS  5000U
 
 static uint32_t m_last_btn_press = 0;
 
@@ -55,6 +62,19 @@ static bool m_is_b_btn_release = false;
 static bool m_is_a_btn_release = false;
 
 static bool m_system_off_processing = false;
+static bool m_battery_status_display_active = false;
+static uint32_t m_battery_status_display_started_at = 0;
+static uint8_t m_battery_status_display_leds = 0;
+extern bool g_usb_led_marquee_enable;
+
+static void battery_status_display_restore_slot(void);
+static void battery_status_display_stop(void);
+static bool battery_status_display_cancel_on_button(void);
+static void battery_status_display_on_button_cancel(void);
+static void play_power_on_animation(uint8_t slot, uint8_t dir, uint8_t color);
+
+// NFC field generator state
+volatile bool m_is_field_on = false;
 
 // cpu reset reason
 static uint32_t m_reset_source;
@@ -129,6 +149,11 @@ void rng_drv_and_srand_init(void) {
 
     // Finally initialize the srand seeds in the c standard library
     srand(rand_int);
+
+    // Seed the MFC LFSR PRNG with the same hardware random value.
+    // This makes nonce generation follow the real Mifare Classic LFSR pattern
+    // so readers that fingerprint PRNG type (e.g. Eltis) accept the emulated card.
+    nfc_tag_mf1_prng_seed(rand_int);
 }
 
 /**@brief Initialize GPIO matrix library
@@ -139,12 +164,41 @@ static void gpio_te_init(void) {
     APP_ERROR_CHECK(err_code);
 }
 
+#if defined(PROJECT_CHAMELEON_ULTRA)
+static void field_generator_rainbow_loop(void) {
+    static uint8_t color_index = 0;
+    static uint32_t last_update = 0;
+
+    if (!m_is_field_on) return;
+
+    uint32_t now = app_timer_cnt_get();
+
+    if (app_timer_cnt_diff_compute(now, last_update) < APP_TIMER_TICKS(100)) {
+        return;
+    }
+    last_update = now;
+
+    // Rainbow colors
+    const uint8_t colors[] = {RGB_RED, RGB_YELLOW, RGB_GREEN, RGB_CYAN, RGB_BLUE, RGB_MAGENTA};
+
+    set_slot_light_color(colors[color_index]);
+    uint32_t *led_pins = hw_get_led_array();
+
+    // Light up all LEDs with current color
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_set(led_pins[i]);
+    }
+
+    color_index = (color_index + 1) % 6;
+}
+#endif
+
 /**@brief Button Matrix Events
  */
 static void button_pin_handler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t action) {
     device_mode_t mode = get_device_mode();
-    // Temporarily allow only the analog card mode to respond to button operations
-    if (mode == DEVICE_MODE_TAG) {
+    // Allow button operations in both tag and reader mode
+    if (mode == DEVICE_MODE_TAG || mode == DEVICE_MODE_READER) {
         static nrf_drv_gpiote_pin_t pin_static;                                  // Use static internal variables to store the GPIO where the current event occurred
         pin_static = pin;                                                        // Cache the button that currently triggers the event into an internal variable
         app_timer_start(m_button_check_timer, APP_TIMER_TICKS(50), &pin_static); // Start timer anti-shake
@@ -162,7 +216,9 @@ static void timer_button_event_handle(void *arg) {
         NRF_LOG_INFO("BUTTON press during shutdown");
         return;
     }
+
     nrf_drv_gpiote_pin_t pin = *(nrf_drv_gpiote_pin_t *)arg;
+
     // Check here if the current GPIO is at the pressed level
     if (nrf_gpio_pin_read(pin) == 1) {
         if (pin == BUTTON_1) {
@@ -186,7 +242,7 @@ static void timer_button_event_handle(void *arg) {
         uint32_t now = app_timer_cnt_get();
         uint32_t ticks = app_timer_cnt_diff_compute(now, m_last_btn_press);
 
-        bool is_long_press = ticks > APP_TIMER_TICKS(1000);
+        bool is_long_press = ticks > APP_TIMER_TICKS(settings_get_long_press_threshold());
 
         if (pin == BUTTON_1 && m_is_b_btn_press == true) {
             // If button is disabled, we can't dispatch key event.
@@ -263,24 +319,28 @@ static void system_off_enter(void) {
         for (uint8_t i = 0; i < RGB_LIST_NUM; i++) {
             nrf_gpio_pin_clear(p_led_array[i]);
         }
+        // Power off animation
         uint8_t animation_config = settings_get_animation_config();
-        if (animation_config == SettingsAnimationModeFull) {
-            uint8_t slot = tag_emulation_get_slot();
-            // Power off animation
-            uint8_t dir = slot > 3 ? 1 : 0;
-            uint8_t color = get_color_by_slot(slot);
-            if (m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) {
-                if (m_reset_source & NRF_POWER_RESETREAS_NFC_MASK) {
-                    color = 1;
-                } else {
-                    color = 2;
-                }
+        uint8_t slot = tag_emulation_get_slot();
+        uint8_t dir = slot > 3 ? 1 : 0;
+        uint8_t color = get_color_by_slot(slot);
+        if (m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) {
+            if (m_reset_source & NRF_POWER_RESETREAS_NFC_MASK) {
+                color = 1;
+            } else {
+                color = 2;
             }
-            if (m_system_off_processing) ledblink5(color, slot, dir ? 7 : 0);
-            if (m_system_off_processing) ledblink4(color, dir, 7, 99, 75);
-            if (m_system_off_processing) ledblink4(color, !dir, 7, 75, 50);
-            if (m_system_off_processing) ledblink4(color, dir, 7, 50, 25);
-            if (m_system_off_processing) ledblink4(color, !dir, 7, 25, 0);
+        }
+        if (animation_config == SettingsAnimationModeFull) {
+            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, slot, dir ? 7 : 0);
+            if (m_system_off_processing) rgb_marquee_sweep_fade(color, dir, 7, 99, 75);
+            if (m_system_off_processing) rgb_marquee_sweep_fade(color, !dir, 7, 75, 50);
+            if (m_system_off_processing) rgb_marquee_sweep_fade(color, dir, 7, 50, 25);
+            if (m_system_off_processing) rgb_marquee_sweep_fade(color, !dir, 7, 25, 0);
+        } else if (animation_config == SettingsAnimationModeMinimal) {
+            if (m_system_off_processing) rgb_marquee_sweep_from_to(color, slot, !dir ? 7 : 0);
+        } else if (animation_config == SettingsAnimationModeSymmetric) {
+            if (m_system_off_processing) rgb_marquee_symmetric_in(color, slot);
         }
         rgb_marquee_stop();
         if (!m_system_off_processing) {
@@ -357,13 +417,13 @@ static void system_off_enter(void) {
     app_timer_stop_all();
 
     // Check whether there are low -frequency fields, solving very strong field signals during dormancy have always caused the comparator to be at a high level input state, so that the problem of uprising the rising edge cannot be awakened.
-    if (lf_is_field_exists()) {
+    if (is_lf_field_exists()) {
         // Close the comparator
         nrf_drv_lpcomp_disable();
         // Set the reason for Reset. After restarting, you need to get this reason to avoid misjudgment from the source of wake up.
         sd_power_gpregret_clr(1, GPREGRET_CLEAR_VALUE_DEFAULT);
         sd_power_gpregret_set(1, RESET_ON_LF_FIELD_EXISTS_Msk);
-        // Trigger the RESET awakening system, restart the simulation process
+        // Trigger the RESET awakening system, restart the emulation process
         nrf_pwr_mgmt_shutdown(NRF_PWR_MGMT_SHUTDOWN_RESET);
         return;
     };
@@ -422,11 +482,13 @@ static void check_wakeup_src(void) {
         // Button wake-up boot animation
         uint8_t animation_config = settings_get_animation_config();
         if (animation_config == SettingsAnimationModeFull) {
-            ledblink2(color, !dir, 11);
-            ledblink2(color, dir, 11);
-            ledblink2(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, 11);
+            rgb_marquee_sweep_to(color, dir, 11);
+            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
         } else if (animation_config == SettingsAnimationModeMinimal) {
-            ledblink2(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+        } else if (animation_config == SettingsAnimationModeSymmetric) {
+            rgb_marquee_symmetric_out(color, slot);
         } else {
             set_slot_light_color(color);
         }
@@ -434,8 +496,8 @@ static void check_wakeup_src(void) {
         // The indicator of the current card slot lights up at the end of the animation
         light_up_by_slot();
 
-        // If no operation follows, wait for the timeout and then deep hibernate
-        sleep_timer_start(SLEEP_DELAY_MS_BUTTON_WAKEUP);
+        // If no operation follows, wait for the configured timeout and then deep hibernate
+        sleep_timer_start(settings_get_sleep_timeout());
     } else if ((m_reset_source & (NRF_POWER_RESETREAS_NFC_MASK | NRF_POWER_RESETREAS_LPCOMP_MASK)) ||
                (m_gpregret_val & RESET_ON_LF_FIELD_EXISTS_Msk)) {
         NRF_LOG_INFO("WakeUp from rfid field");
@@ -453,15 +515,18 @@ static void check_wakeup_src(void) {
             }
         }
 
-        // It is currently the wake -up system of the simulation card event, we can make the strong lights on the field first
+        // It is currently the wake-up system of the emulation card event, we can make the strong lights on the field first
         TAG_FIELD_LED_ON();
 
         uint8_t animation_config = settings_get_animation_config();
         if (animation_config == SettingsAnimationModeFull) {
             // In the case of field wake-up, only one round of RGB is swept as the power-on animation
-            ledblink2(color, !dir, dir ? slot : 7 - slot);
+            rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+        } else if (animation_config == SettingsAnimationModeSymmetric) {
+            rgb_marquee_symmetric_out(color, slot);
+        } else {
+            set_slot_light_color(color);
         }
-        set_slot_light_color(color);
         light_up_by_slot();
 
         // We can only run tag emulation at field wakeup source.
@@ -488,9 +553,20 @@ static void check_wakeup_src(void) {
         tag_emulation_factory_init();
 
         // RGB
-        ledblink2(0, !dir, 11);
-        ledblink2(1, dir, 11);
-        ledblink2(2, !dir, 11);
+        uint8_t animation_config = settings_get_animation_config();
+        if (animation_config == SettingsAnimationModeFull) {
+            rgb_marquee_sweep_to(0, !dir, 11);
+            rgb_marquee_sweep_to(1, dir, 11);
+            rgb_marquee_sweep_to(2, !dir, 11);
+        } else if (animation_config == SettingsAnimationModeMinimal) {
+            rgb_marquee_sweep_from_to(0, 0, 2);
+            rgb_marquee_sweep_from_to(1, 2, 5);
+            rgb_marquee_sweep_from_to(2, 5, 7);
+        } else if (animation_config == SettingsAnimationModeSymmetric) {
+            rgb_marquee_symmetric_out(0, ~0);
+            rgb_marquee_symmetric_in(1, ~0);
+            rgb_marquee_symmetric_out(2, ~0);
+        }
 
         // Show RGB for slot.
         set_slot_light_color(color);
@@ -521,18 +597,51 @@ static void cycle_slot(bool dec) {
     }
     // Update status only if the new card slot switch is valid
     tag_emulation_change_slot(slot_new, true); // Tell the analog card module that we need to switch card slots
+    // Turn off the LEDs in case we were showing the battery status
+    rgb_marquee_stop();
+    uint32_t *led_pins = hw_get_led_array();
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
     // Go back to the color corresponding to the field enablement type
-    uint8_t color_now = get_color_by_slot(slot_now);
-    uint8_t color_new = get_color_by_slot(slot_new);
-    // Switching the light effect of the card slot
-    ledblink3(slot_now, color_now, slot_new, color_new);
-    // Switched the card slot, we need to re-light
-    light_up_by_slot();
-    // Then switch the color of the light again
-    set_slot_light_color(color_new);
+    apply_slot_change(slot_now, slot_new);
+}
+
+static void battery_status_display_restore_slot(void) {
+    uint8_t slot = tag_emulation_get_slot();
+    uint8_t color = get_color_by_slot(slot);
+    uint8_t dir = slot > 3 ? 1 : 0;
+
+    rgb_marquee_stop();
+    set_slot_light_color(color);
+    uint32_t *led_pins = hw_get_led_array();
+    for (int i = m_battery_status_display_leds; i > 0; i--) {
+        nrf_gpio_pin_clear(led_pins[i - 1]);
+        bsp_delay_ms(50);
+    }
+    play_power_on_animation(slot, dir, color);
+}
+
+static void battery_status_display_stop(void) {
+    battery_status_display_restore_slot();
+    m_battery_status_display_active = false;
 }
 
 static void show_battery(void) {
+    static const uint8_t health_colors[] = {
+        RGB_RED,
+        RGB_YELLOW,
+        RGB_YELLOW,
+        RGB_GREEN,
+        RGB_CYAN,
+    };
+    static const uint8_t health_blinks[] = {
+        2U,
+        1U,
+        0U,
+        0U,
+        0U,
+    };
     rgb_marquee_stop();
     uint32_t *led_pins = hw_get_led_array();
     // if still in the first 4s after boot, blink red while waiting for battery info
@@ -547,19 +656,102 @@ static void show_battery(void) {
         }
         bsp_delay_ms(100);
     }
-    // ok we have data, show level with cyan LEDs
+    battery_health_t battery_health = battery_health_from_measurement(
+        batt_lvl_in_milli_volts,
+        percentage_batt_lvl);
+    uint8_t health_index = battery_health_to_code(battery_health);
+    uint8_t fill_color = health_colors[health_index];
+    uint8_t extra_blinks = health_blinks[health_index];
+
+    // ok we have data, show the level using a color that reflects the health
     for (int i = 0; i < RGB_LIST_NUM; i++) {
         nrf_gpio_pin_clear(led_pins[i]);
     }
-    set_slot_light_color(RGB_CYAN);
-    uint8_t nleds = (percentage_batt_lvl * 2) / 25; // 0->7 (8 for 100% but this is ignored)
+    set_slot_light_color(fill_color);
+    uint8_t nleds = (percentage_batt_lvl * RGB_LIST_NUM + 99U) / 100U;
+    if (nleds > RGB_LIST_NUM) {
+        nleds = RGB_LIST_NUM;
+    }
     for (int i = 0; i < RGB_LIST_NUM; i++) {
-        if (i <= nleds) {
+        if (i < nleds) {
             nrf_gpio_pin_set(led_pins[i]);
             bsp_delay_ms(50);
         }
     }
-    // nothing special to finish, we wait for sleep or slot change
+    if (extra_blinks > 0U) {
+        for (uint8_t blink = 0U; blink < extra_blinks; blink++) {
+            bsp_delay_ms(180);
+            for (int i = 0; i < RGB_LIST_NUM; i++) {
+                nrf_gpio_pin_clear(led_pins[i]);
+            }
+            bsp_delay_ms(140);
+            for (int i = 0; i < RGB_LIST_NUM; i++) {
+                if (i < nleds) {
+                    nrf_gpio_pin_set(led_pins[i]);
+                }
+            }
+        }
+    }
+    m_battery_status_display_leds = nleds;
+    m_battery_status_display_active = true;
+    m_battery_status_display_started_at = app_timer_cnt_get();
+}
+
+static void play_power_on_animation(uint8_t slot, uint8_t dir, uint8_t color) {
+    uint8_t animation_config = settings_get_animation_config();
+    if (animation_config == SettingsAnimationModeFull) {
+        rgb_marquee_sweep_to(color, !dir, 11);
+        rgb_marquee_sweep_to(color, dir, 11);
+        rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+    } else if (animation_config == SettingsAnimationModeMinimal) {
+        rgb_marquee_sweep_to(color, !dir, dir ? slot : 7 - slot);
+    } else if (animation_config == SettingsAnimationModeSymmetric) {
+        rgb_marquee_symmetric_out(color, slot);
+    }
+
+    set_slot_light_color(color);
+    light_up_by_slot();
+}
+
+static void battery_status_display_process(void) {
+    if (!m_battery_status_display_active) {
+        return;
+    }
+
+    if (battery_status_display_cancel_on_button()) {
+        battery_status_display_on_button_cancel();
+        return;
+    }
+
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, m_battery_status_display_started_at) >= APP_TIMER_TICKS(BATTERY_STATUS_DISPLAY_DURATION_MS)) {
+        battery_status_display_stop();
+    }
+}
+
+static bool battery_status_display_cancel_on_button(void) {
+    if (!m_battery_status_display_active) {
+        return false;
+    }
+
+    if (!(m_is_a_btn_release || m_is_b_btn_release)) {
+        return false;
+    }
+
+    m_is_a_btn_release = false;
+    m_is_b_btn_release = false;
+    m_is_a_btn_press = false;
+    m_is_b_btn_press = false;
+    m_is_btn_long_press = false;
+    battery_status_display_stop();
+    return true;
+}
+
+static void battery_status_display_on_button_cancel(void) {
+    g_usb_led_marquee_enable = false;
+    if (!m_is_field_on) {
+        sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+    }
 }
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -587,61 +779,96 @@ static void offline_status_blink_color(uint8_t blink_color) {
 }
 
 static void offline_status_error(void) {
-    offline_status_blink_color(0);
+    offline_status_blink_color(RGB_RED);
 }
 
 static void offline_status_ok(void) {
-    offline_status_blink_color(1);
+    offline_status_blink_color(RGB_GREEN);
 }
 
-// fast detect a 14a tag uid to sim
-static void btn_fn_copy_ic_uid(void) {
-    bool lf_copy_succeeded = false;
-    bool hf_copy_succeeded = false;
-    uint8_t status;
-    uint8_t id_buffer[5] = { 0x00 };
-    // get 14a tag res buffer;
-    uint8_t slot_now = tag_emulation_get_slot();
-    tag_slot_specific_type_t tag_types;
-    tag_emulation_get_specific_types_by_slot(slot_now, &tag_types);
-
-    nfc_tag_14a_coll_res_entity_t *antres = NULL;
-
-    bool is_reader_mode_now = get_device_mode() == DEVICE_MODE_READER;
-    // first, we need switch to reader mode.
-    if (!is_reader_mode_now) {
-        // enter reader mode
-        reader_mode_enter();
-        bsp_delay_ms(8);
-        NRF_LOG_INFO("Start reader mode to offline copy.")
+static void btn_fn_copy_lf(uint8_t slot, tag_specific_type_t type) {
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(type);
+    if (buffer == NULL) {
+        // empty HF slot, nothing to do
+        return;
     }
-
-    switch (tag_types.tag_lf) {
-        case TAG_TYPE_EM410X:
-            status = PcdScanEM410X(id_buffer);
-
-            if (status == STATUS_LF_TAG_OK) {
-                tag_data_buffer_t *buffer = get_buffer_by_tag_type(TAG_TYPE_EM410X);
-                memcpy(buffer->buffer, id_buffer, LF_EM410X_TAG_ID_SIZE);
-                tag_emulation_load_by_buffer(TAG_TYPE_EM410X, false);
-                NRF_LOG_INFO("Offline LF uid copied")
-                lf_copy_succeeded = true;
-                offline_status_ok();
-            } else {
-                NRF_LOG_INFO("No LF tag found");
-                offline_status_error();
-            }
+    size_t size = 0;
+    uint8_t id_buffer[16] = {0x00};
+    uint8_t status = STATUS_LF_TAG_NO_FOUND;
+    uint8_t *data = NULL;
+    switch (type) {
+        case TAG_TYPE_HID_PROX:
+            status = scan_hidprox(id_buffer, 0);
+            size = LF_HIDPROX_TAG_ID_SIZE;
+            data = id_buffer;
             break;
-        case TAG_TYPE_UNDEFINED:
-            // empty LF slot, nothing to do, move on to HF
+        case TAG_TYPE_IOPROX:
+            status = scan_ioprox(id_buffer, 0);
+            size = LF_IOPROX_TAG_ID_SIZE;
+            data = id_buffer;
+            break;
+        case TAG_TYPE_EM410X:
+        case TAG_TYPE_EM410X_ELECTRA: {
+            status = scan_em410x(id_buffer);
+            tag_specific_type_t detected_type = (id_buffer[0] << 8) | id_buffer[1];
+            tag_specific_type_t new_type =
+                detected_type == TAG_TYPE_EM410X_ELECTRA ? TAG_TYPE_EM410X_ELECTRA : TAG_TYPE_EM410X;
+
+            // If we read Electra but the slot was classic (or vice versa), switch slot type automatically.
+            if (new_type != type) {
+                tag_emulation_change_type(slot, new_type);
+                type = new_type;
+            }
+
+            size = (new_type == TAG_TYPE_EM410X_ELECTRA) ? LF_EM410X_ELECTRA_TAG_ID_SIZE : LF_EM410X_TAG_ID_SIZE;
+            data = id_buffer + 2;  // skip tag type
+            break;
+        }
+        case TAG_TYPE_VIKING:
+            status = scan_viking(id_buffer);
+            size = LF_VIKING_TAG_ID_SIZE;
+            data = id_buffer;
+            break;
+        case TAG_TYPE_JABLOTRON:
+            status = scan_jablotron(id_buffer);
+            size = LF_JABLOTRON_TAG_ID_SIZE;
+            data = id_buffer;
             break;
         default:
             NRF_LOG_ERROR("Unsupported LF tag type")
             offline_status_error();
     }
 
-    tag_data_buffer_t *buffer = get_buffer_by_tag_type(tag_types.tag_hf);
-    switch (tag_types.tag_hf) {
+    if (status == STATUS_LF_TAG_OK) {
+        memcpy(buffer->buffer, data, size);
+        tag_emulation_load_by_buffer(type, false);
+        NRF_LOG_INFO("Offline lf tag copied")
+
+        char *nick = "cloned";
+        uint8_t nick_buffer[36];
+        nick_buffer[0] = strlen(nick);
+        memcpy(nick_buffer + 1, nick, nick_buffer[0]);
+
+        fds_slot_record_map_t map_info;
+        get_fds_map_by_slot_sense_type_for_nick(slot, TAG_SENSE_LF, &map_info);
+        fds_write_sync(map_info.id, map_info.key, sizeof(nick_buffer), nick_buffer);
+        offline_status_ok();
+    } else {
+        NRF_LOG_INFO("No lf tag found");
+        offline_status_error();
+    }
+}
+
+static void btn_fn_copy_hf(uint8_t slot, tag_specific_type_t type) {
+    tag_data_buffer_t *buffer = get_buffer_by_tag_type(type);
+    if (buffer == NULL) {
+        // empty HF slot, nothing to do
+        return;
+    }
+
+    uint8_t status = 0;
+    nfc_tag_14a_coll_res_entity_t *antres = NULL;
+    switch (type) {
         case TAG_TYPE_MIFARE_Mini:
         case TAG_TYPE_MIFARE_1024:
         case TAG_TYPE_MIFARE_2048:
@@ -651,71 +878,85 @@ static void btn_fn_copy_ic_uid(void) {
             break;
         }
 
+        case TAG_TYPE_NTAG_210:
+        case TAG_TYPE_NTAG_212:
         case TAG_TYPE_NTAG_213:
         case TAG_TYPE_NTAG_215:
-        case TAG_TYPE_NTAG_216: {
-            nfc_tag_ntag_information_t *p_info = (nfc_tag_ntag_information_t *)buffer->buffer;
+        case TAG_TYPE_NTAG_216:
+        case TAG_TYPE_MF0ICU1:
+        case TAG_TYPE_MF0ICU2:
+        case TAG_TYPE_MF0UL11:
+        case TAG_TYPE_MF0UL21: {
+            nfc_tag_mf0_ntag_information_t *p_info = (nfc_tag_mf0_ntag_information_t *)buffer->buffer;
             antres = &(p_info->res_coll);
             break;
         }
-
-        case TAG_TYPE_UNDEFINED:
-            // empty HF slot, nothing to do
-            break;
-
         default:
             NRF_LOG_ERROR("Unsupported HF tag type")
             offline_status_error();
             break;
     }
-    if (antres != NULL) {
-        if (!is_reader_mode_now) {
-            // finish HF reader initialization
-            pcd_14a_reader_reset();
-        }
-        pcd_14a_reader_antenna_on();
-        bsp_delay_ms(8);
-        // select a tag
-        picc_14a_tag_t tag;
 
-        status = pcd_14a_reader_scan_auto(&tag);
-        pcd_14a_reader_antenna_off();
-        if (status == STATUS_HF_TAG_OK) {
-            // copy uid
-            antres->size = tag.uid_len;
-            memcpy(antres->uid, tag.uid, tag.uid_len);
-            // copy atqa
-            memcpy(antres->atqa, tag.atqa, 2);
-            // copy sak
-            antres->sak[0] = tag.sak;
-            // copy ats
-            antres->ats.length = tag.ats_len;
-            memcpy(antres->ats.data, tag.ats, tag.ats_len);
-            NRF_LOG_INFO("Offline HF uid copied")
-            hf_copy_succeeded = true;
-            offline_status_ok();
-        } else {
-            NRF_LOG_INFO("No HF tag found");
-            offline_status_error();
-        }
+    if (antres == NULL) {
+        return;
     }
-    if (lf_copy_succeeded || hf_copy_succeeded) {
-        fds_slot_record_map_t map_info;
+
+    pcd_14a_reader_antenna_on();
+    bsp_delay_ms(8);
+    // select a tag
+    picc_14a_tag_t tag;
+
+    status = pcd_14a_reader_scan_auto(&tag);
+    pcd_14a_reader_antenna_off();
+    if (status == STATUS_HF_TAG_OK) {
+        // copy uid
+        antres->size = tag.uid_len;
+        memcpy(antres->uid, tag.uid, tag.uid_len);
+        // copy atqa
+        memcpy(antres->atqa, tag.atqa, 2);
+        // copy sak
+        antres->sak[0] = tag.sak;
+        // copy ats
+        antres->ats.length = tag.ats_len;
+        memcpy(antres->ats.data, tag.ats, tag.ats_len);
+        NRF_LOG_INFO("Offline HF uid copied")
+
         char *nick = "cloned";
-        uint8_t buffer[36];
-        buffer[0] = strlen(nick);
-        memcpy(buffer + 1, nick, buffer[0]);
-        if (lf_copy_succeeded) {
-            get_fds_map_by_slot_sense_type_for_nick(slot_now, TAG_SENSE_LF, &map_info);
-            fds_write_sync(map_info.id, map_info.key, sizeof(buffer), buffer);
-        }
-        if (hf_copy_succeeded) {
-            get_fds_map_by_slot_sense_type_for_nick(slot_now, TAG_SENSE_HF, &map_info);
-            fds_write_sync(map_info.id, map_info.key, sizeof(buffer), buffer);
-        }
+        uint8_t nick_buffer[36];
+        nick_buffer[0] = strlen(nick);
+        memcpy(nick_buffer + 1, nick, nick_buffer[0]);
+
+        fds_slot_record_map_t map_info;
+        get_fds_map_by_slot_sense_type_for_nick(slot, TAG_SENSE_HF, &map_info);
+        fds_write_sync(map_info.id, map_info.key, sizeof(nick_buffer), nick_buffer);
+        offline_status_ok();
+    } else {
+        NRF_LOG_INFO("No HF tag found");
+        offline_status_error();
     }
+}
+
+// fast detect a 14a tag uid to sim
+static void btn_fn_copy_ic_uid(void) {
+    // get 14a tag res buffer;
+    uint8_t slot_now = tag_emulation_get_slot();
+    tag_slot_specific_type_t tag_types;
+    tag_emulation_get_specific_types_by_slot(slot_now, &tag_types);
+
+    bool is_in_reader_mode = get_device_mode() == DEVICE_MODE_READER;
+    // first, we need switch to reader mode.
+    if (!is_in_reader_mode) {
+        // enter reader mode
+        reader_mode_enter();
+        bsp_delay_ms(8);
+        NRF_LOG_INFO("Start reader mode to offline copy.")
+    }
+
+    btn_fn_copy_lf(slot_now, tag_types.tag_lf);
+    btn_fn_copy_hf(slot_now, tag_types.tag_hf);
+
     // keep reader mode or exit reader mode.
-    if (!is_reader_mode_now) {
+    if (!is_in_reader_mode) {
         tag_mode_enter();
     }
 }
@@ -737,23 +978,80 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
         case SettingsButtonCloneIcUid:
             btn_fn_copy_ic_uid();
             break;
+        case SettingsButtonNfcFieldGenerator:
+            if (!m_is_field_on) {
+                // Initialize reader hardware if not already in reader mode
+                device_mode_t current_mode = get_device_mode();
+                if (current_mode != DEVICE_MODE_READER) {
+                    // Temporarily init reader hardware just for the field
+                    nrf_gpio_cfg_output(READER_POWER);
+                    nrf_gpio_pin_set(READER_POWER);     // reader power enable
+                    nrf_gpio_cfg_output(HF_ANT_SEL);
+                    nrf_gpio_pin_clear(HF_ANT_SEL);     // hf ant switch to reader mode
+
+                    pcd_14a_reader_init();
+                    bsp_delay_ms(10);
+                }
+
+                pcd_14a_reader_reset();
+                pcd_14a_reader_antenna_on();
+                m_is_field_on = true;
+                NRF_LOG_INFO("NFC field ON");
+
+                // Set initial rainbow state
+                set_slot_light_color(RGB_RED);
+                uint32_t *led_pins = hw_get_led_array();
+                for (int i = 0; i < RGB_LIST_NUM; i++) {
+                    nrf_gpio_pin_set(led_pins[i]);
+                }
+
+                // Stop sleep timer while field is active
+                NRF_LOG_INFO("Stopping sleep timer for field generator");
+                sleep_timer_stop();
+                NRF_LOG_INFO("Sleep timer stopped");
+            } else {
+                pcd_14a_reader_antenna_off();
+                m_is_field_on = false;
+                NRF_LOG_INFO("NFC field OFF");
+
+                // If we're not in reader mode, clean up the hardware
+                device_mode_t current_mode = get_device_mode();
+                if (current_mode != DEVICE_MODE_READER) {
+                    pcd_14a_reader_uninit();
+                    nrf_gpio_pin_clear(READER_POWER);   // reader power disable
+                    nrf_gpio_pin_set(HF_ANT_SEL);       // hf ant switch back to tag mode
+                }
+
+                // Restore normal LED
+                light_up_by_slot();
+
+                // Restart sleep timer
+                NRF_LOG_INFO("Field off, restarting sleep timer");
+                sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+                NRF_LOG_INFO("Sleep timer restarted");
+            }
+            break;
 #endif
 
         case SettingsButtonShowBattery:
             show_battery();
+            break;
 
         default:
-            NRF_LOG_ERROR("Unsupported button function")
+            NRF_LOG_ERROR("Unsupported button function");
             break;
     }
 }
 
 /**@brief button press event process
  */
-extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
+        if (battery_status_display_cancel_on_button()) {
+            battery_status_display_on_button_cancel();
+            return;
+        }
         if (m_is_a_btn_release) {
             if (!m_is_btn_long_press) {
                 run_button_function_by_settings(settings_get_button_press_config('a'));
@@ -772,8 +1070,10 @@ static void button_press_process(void) {
         }
         // Disable led marquee for usb at button pressed.
         g_usb_led_marquee_enable = false;
-        // Re-delay into hibernation
-        sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+        // Re-delay into hibernation (unless field is on)
+        if (!m_is_field_on) {
+            sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+        }
     }
 }
 
@@ -792,12 +1092,17 @@ static void blink_usb_led_status(void) {
         }
     } else {
         // The light effect is enabled and can be displayed
-        if (is_rgb_marquee_enable()) {
+        if (rgb_marquee_is_enabled()) {
             is_working = true;
             if (g_usb_port_opened) {
-                ledblink1(color, dir);
+                uint8_t animation_config = settings_get_animation_config();
+                if (animation_config == SettingsAnimationModeSymmetric) {
+                    rgb_marquee_usb_open_symmetric(color);
+                } else {
+                    rgb_marquee_usb_open_sweep(color, dir);
+                }
             } else {
-                ledblink6();
+                rgb_marquee_usb_idle();
             }
         } else {
             if (is_working) {
@@ -854,7 +1159,7 @@ int main(void) {
     on_data_frame_complete(on_data_frame_received);
 
     check_wakeup_src();       // Detect wake-up source and decide BLE broadcast and subsequent hibernation action according to the wake-up source
-    tag_mode_enter();         // Enter card simulation mode by default
+    tag_mode_enter();         // Enter card emulation mode by default
 
     // usbd event listener
     APP_ERROR_CHECK(app_usbd_power_events_enable());
@@ -865,10 +1170,22 @@ int main(void) {
     while (1) {
         // process lesc event
         lesc_event_process();
+        battery_status_display_process();
         // Button event process
         button_press_process();
-        // Led blink at usb status
-        blink_usb_led_status();
+
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        // Field generator rainbow animation
+        if (!m_battery_status_display_active) {
+            field_generator_rainbow_loop();
+        }
+#endif
+
+        // Led blink at usb status (only if field generator is off)
+        if (!m_is_field_on && !m_battery_status_display_active) {
+            blink_usb_led_status();
+        }
+
         // Data pack process
         data_frame_process();
         // Log print process
